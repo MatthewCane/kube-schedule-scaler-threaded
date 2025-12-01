@@ -4,8 +4,13 @@
 import json
 import logging
 import os
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
+from dataclasses import dataclass
 from datetime import datetime, timedelta
+from queue import Queue, ShutDown
+from signal import SIGINT, SIGTERM, signal, strsignal
 from time import sleep
+from types import FrameType
 
 import dateutil.tz
 import pykube
@@ -13,9 +18,45 @@ from croniter import croniter
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
-    format="%(asctime)s %(levelname)s - %(filename)s:%(lineno)d - %(message)s",
+    format="%(asctime)s %(levelname)s - %(message)s",
     datefmt="%d-%m-%Y %H:%M:%S",
 )
+
+
+@dataclass(frozen=True)
+class ScaleTarget:
+    name: str
+    namespace: str
+    schedule_actions: list[dict[str, str]]
+
+
+def handle_shutdown(signum: int, frame: FrameType | None) -> None:
+    """Handle shutdown signals."""
+    sig_str = strsignal(signum)
+    sig_str = sig_str.split(":")[0] if sig_str else "Unknown"
+    logging.info(f"Received {sig_str} signal, gracefully exiting.")
+    global shutdown
+    shutdown = True
+    count = 0
+    while count < GRACEFUL_SHUTDOWN_PERIOD_MINS:
+        if queue.qsize() == 0:
+            break
+        count += GRACEFUL_SHUTDOWN_PERIOD_MINS / 10
+        sleep(GRACEFUL_SHUTDOWN_PERIOD_MINS / 10)
+    queue.shutdown()
+
+
+def sleep_thread(seconds: float):
+    """Sleep for the given number of seconds.
+
+    If shutdown flag is set, exit the sleep early.
+    """
+    global shutdown
+    end_time = datetime.now().timestamp() + seconds
+    while datetime.now().timestamp() <= end_time:
+        if shutdown:
+            break
+        sleep(0.1)
 
 
 def get_kube_api() -> pykube.HTTPClient:
@@ -23,27 +64,36 @@ def get_kube_api() -> pykube.HTTPClient:
     return pykube.HTTPClient(pykube.KubeConfig.from_env())
 
 
-def deployments_to_scale() -> dict[tuple[str, str], list[dict[str, str]]]:
-    """Getting the deployments configured for schedule scaling"""
-    deployments = []
-    scaling_dict = {}
+def deployments_to_scale(queue) -> None:
+    """Gets the deployments configured for schedule scaling and puts them on the queue"""
+    logging.info("Fetching scaling tasks")
+    scale_targets: list[ScaleTarget] = []
+
     for deployment in pykube.Deployment.objects(api).filter(namespace=pykube.all):
-        f_deployment: tuple[str, str] = (deployment.namespace, deployment.name)
+        namespace = deployment.namespace
+        name = deployment.name
 
         annotations = deployment.metadata.get("annotations", {})
         schedule_actions = parse_schedules(
-            annotations.get("zalando.org/schedule-actions", "[]"), f_deployment
+            annotations.get("zalando.org/schedule-actions", "[]"), (name, namespace)
         )
 
         if not schedule_actions:
             continue
 
-        deployments.append([deployment.metadata["name"]])
-        scaling_dict[f_deployment] = schedule_actions
-    if not deployments:
-        logging.info("No deployment is configured for schedule scaling")
+        scale_targets.append(
+            ScaleTarget(
+                name=name, namespace=namespace, schedule_actions=schedule_actions
+            )
+        )
 
-    return scaling_dict
+    if not scale_targets:
+        logging.info("No deployment is configured for schedule scaling")
+    else:
+        logging.info("Found %s deployments to scale", len(scale_targets))
+
+    for item in scale_targets:
+        queue.put(item)
 
 
 def parse_schedules(
@@ -85,10 +135,11 @@ def get_wait_sec() -> float:
     return (future - now).total_seconds()
 
 
-def process_deployment(deployment: tuple[str, str], schedules: list[dict[str, str]]) -> None:
+def process_deployment(scale_target: ScaleTarget) -> None:
     """Determine actions to run for the given deployment and list of schedules"""
-    namespace, name = deployment
-    for schedule in schedules:
+    namespace = scale_target.namespace
+    name = scale_target.name
+    for schedule in scale_target.schedule_actions:
         # when provided, convert the values to int
         replicas = schedule.get("replicas", None)
         if replicas is not None:
@@ -106,7 +157,7 @@ def process_deployment(deployment: tuple[str, str], schedules: list[dict[str, st
             return
 
         schedule_timezone = schedule.get("tz", None)
-        logging.debug("%s %s", deployment, schedule)
+        logging.debug("%s/%s %s", namespace, name, schedule)
 
         # if less than 60 seconds have passed from the trigger
         if get_delta_sec(schedule_expr, schedule_timezone) < 60:
@@ -184,14 +235,67 @@ def scale_hpa(
         logging.exception(err)
 
 
-if __name__ == "__main__":
-    logging.info("Main loop started")
-    while True:
-        global api
-        api = get_kube_api()
+def collector(queue: Queue) -> None:
+    """Collects scaling actions.
 
-        logging.debug("Waiting until the next minute")
-        sleep(get_wait_sec())
-        logging.debug("Getting deployments")
-        for d, s in deployments_to_scale().items():
-            process_deployment(d, s)
+    Every minute on the minute, call the deployments_to_scale function
+    which finds deployments to scale and places the scaling target on
+    the queue.
+    """
+    logging.info("Starting collector thread")
+    global shutdown
+    while True:
+        wait_sec = get_wait_sec()
+        logging.debug("Waiting %ss until next collection time", wait_sec)
+        sleep_thread(wait_sec)
+
+        if shutdown:
+            logging.info("Shutdown signal received, exiting")
+            return
+        logging.debug("collector:calling deployments_to_scale")
+        deployments_to_scale(queue)
+
+
+def processor(queue: Queue) -> None:
+    """Processes scaling requests.
+
+    If a ShutDown object is placed on the queue, the
+    thread will terminate when that object is processed.
+    """
+    logging.info("Starting processor thread")
+    while True:
+        try:
+            item = queue.get()
+        except ShutDown:
+            logging.info("Shutdown signal received, exiting")
+            return
+        process_deployment(item)
+        if queue.qsize() > 10:
+            logging.warning(f"Queue size: {queue.qsize()}")
+
+
+shutdown = False
+GRACEFUL_SHUTDOWN_PERIOD_MINS = 1
+queue: Queue[ScaleTarget] = Queue()
+api = get_kube_api()
+
+signal(SIGTERM, handle_shutdown)
+signal(SIGINT, handle_shutdown)
+
+if __name__ == "__main__":
+    logging.info("Starting main thread")
+    with ThreadPoolExecutor() as executor:
+        futures = [executor.submit(collector, queue), executor.submit(processor, queue)]
+
+        done, _ = wait(futures, return_when=FIRST_EXCEPTION)
+
+        for future in done:
+            try:
+                future.result()
+            except Exception:
+                logging.exception("Application encountered fatal error")
+                handle_shutdown(3, None)
+
+                break
+
+    logging.info("Exiting main thread")

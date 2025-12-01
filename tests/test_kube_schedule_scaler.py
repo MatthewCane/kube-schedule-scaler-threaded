@@ -1,8 +1,8 @@
-from collections.abc import Sequence
 import datetime
 import json
-from os import path
 import subprocess
+from collections.abc import Sequence
+from os import path
 from time import sleep
 
 
@@ -27,7 +27,7 @@ def teardown_module(module):
 
 def get_cron_formatted_time():
     '''Return the cron expr prefix for the next minute, e.g. "43 14"'''
-    now = datetime.datetime.now(datetime.UTC)
+    now = datetime.datetime.now(datetime.timezone.utc)
 
     # get the minute and hour of the next minute from now
     return (now + datetime.timedelta(minutes=1)).strftime("%M %H")
