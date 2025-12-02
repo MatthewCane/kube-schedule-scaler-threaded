@@ -31,18 +31,23 @@ class ScaleTarget:
 
 
 def handle_shutdown(signum: int, frame: FrameType | None) -> None:
-    """Handle shutdown signals."""
+    """Handle shutdown signals.
+
+    This will wait for the shutdown period for the queue to be
+    emptied before calling shutdown on the queue, terminating
+    the processor thread.
+    """
     sig_str = strsignal(signum)
     sig_str = sig_str.split(":")[0] if sig_str else "Unknown"
     logging.info(f"Received {sig_str} signal, gracefully exiting.")
     global shutdown
     shutdown = True
-    count = 0
-    while count < GRACEFUL_SHUTDOWN_PERIOD_MINS:
+    elapsed = 0
+    while elapsed < SHUTDOWN_TIMEOUT_SECONDS:
         if queue.qsize() == 0:
             break
-        count += GRACEFUL_SHUTDOWN_PERIOD_MINS / 10
-        sleep(GRACEFUL_SHUTDOWN_PERIOD_MINS / 10)
+        sleep(0.1)
+        elapsed += 0.1
     queue.shutdown()
 
 
@@ -61,7 +66,7 @@ def sleep_thread(seconds: float):
 
 def get_kube_api() -> pykube.HTTPClient:
     """Initiating the API from Service Account or when running locally from ~/.kube/config"""
-    return pykube.HTTPClient(pykube.KubeConfig.from_env())
+    return pykube.HTTPClient(config=pykube.KubeConfig.from_env(), timeout=10)
 
 
 def deployments_to_scale(queue) -> None:
@@ -275,7 +280,7 @@ def processor(queue: Queue) -> None:
 
 
 shutdown = False
-GRACEFUL_SHUTDOWN_PERIOD_MINS = 1
+SHUTDOWN_TIMEOUT_SECONDS = 60
 queue: Queue[ScaleTarget] = Queue()
 api = get_kube_api()
 
