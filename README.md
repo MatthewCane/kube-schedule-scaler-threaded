@@ -1,5 +1,8 @@
 ﻿# Kubernetes Schedule Scaler
 
+> [!IMPORTANT]
+> This is a fork of [citizensadvice/kube-schedule-scaler](https://github.com/citizensadvice/kube-schedule-scaler) that has been modified to run using multi-threading to process large amounts of deployments in a scalable way. It has not been tested in a production environment so please use at your own risk.
+
 Kubernetes Schedule Scaler allows you to change the number of running replicas
 of a Deployment at specific times. It can be used is to turn on/off
 applications that don't need to be always available and reduce cluster resource
