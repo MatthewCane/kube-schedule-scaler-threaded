@@ -65,7 +65,7 @@ spec:
         runAsUser: 1000
       containers:
       - name: kube-schedule-scaler
-        image: "public.ecr.aws/citizensadvice/kube-schedule-scaler:master"
+        image: "ghcr.io/matthewcane/kube-schedule-scaler-threaded:latest"
         imagePullPolicy: Always
         resources:
           limits:
