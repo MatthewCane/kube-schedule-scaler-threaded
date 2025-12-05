@@ -1,15 +1,14 @@
-FROM python:3.13-alpine
+FROM python:3.13-slim-trixie
 
-COPY requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir -r /tmp/requirements.txt && rm /tmp/requirements.txt
+ENV UV_COMPILE_BYTECODE=1
+ENV UV_NO_CACHE=1
 
-RUN adduser -u 1000 -D app && \
-    mkdir /app && \
-    chown app: /app
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/
 
-USER 1000
 WORKDIR /app
 
-COPY schedule_scaling/ /app/
+COPY . /app
 
-CMD ["python", "-u", "main.py"]
+RUN uv sync --locked --no-editable --no-dev
+
+ENTRYPOINT [ "uv", "run", "schedule_scaling/main.py" ]
