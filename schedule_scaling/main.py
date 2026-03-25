@@ -13,8 +13,9 @@ from time import sleep
 from types import FrameType
 
 import dateutil.tz
-import pykube
 from croniter import croniter
+from kubernetes import client, config
+from kubernetes.client.exceptions import ApiException
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -64,9 +65,20 @@ def sleep_thread(seconds: float):
         sleep(0.1)
 
 
-def get_kube_api() -> pykube.HTTPClient:
+def get_kube_api() -> None:
     """Initiating the API from Service Account or when running locally from ~/.kube/config"""
-    return pykube.HTTPClient(config=pykube.KubeConfig.from_env(), timeout=10)
+    try:
+        config.load_incluster_config()
+        logging.info("Loaded in-cluster config")
+    except config.ConfigException:
+        from kubernetes.config import kube_config
+
+        _, active = kube_config.list_kube_config_contexts()
+        logging.info(
+            "Loaded kubeconfig (user=%s)",
+            active.get("context", {}).get("user", "unknown"),
+        )
+        config.load_kube_config()
 
 
 def deployments_to_scale(queue) -> None:
@@ -74,11 +86,11 @@ def deployments_to_scale(queue) -> None:
     logging.info("Fetching scaling tasks")
     scale_targets: list[ScaleTarget] = []
 
-    for deployment in pykube.Deployment.objects(api).filter(namespace=pykube.all):
-        namespace = deployment.namespace
-        name = deployment.name
+    for deployment in client.AppsV1Api().list_deployment_for_all_namespaces().items:
+        namespace = deployment.metadata.namespace
+        name = deployment.metadata.name
 
-        annotations = deployment.metadata.get("annotations", {})
+        annotations = deployment.metadata.annotations or {}
         schedule_actions = parse_schedules(
             annotations.get("zalando.org/schedule-actions", "[]"), (name, namespace)
         )
@@ -174,24 +186,33 @@ def process_deployment(scale_target: ScaleTarget) -> None:
 
 def scale_deployment(name: str, namespace: str, replicas: int) -> None:
     """Scale the deployment to the given number of replicas"""
+    apps_v1 = client.AppsV1Api()
     try:
-        deployment = (
-            pykube.Deployment.objects(api).filter(namespace=namespace).get(name=name)
+        deployment = apps_v1.read_namespaced_deployment(name=name, namespace=namespace)
+    except ApiException as err:
+        if err.status == 404:
+            logging.warning("Deployment %s/%s does not exist", namespace, name)
+        else:
+            logging.error(
+                "Exception raised while reading deployment %s/%s", namespace, name
+            )
+            logging.exception(err)
+        return
+
+    if replicas == deployment.spec.replicas:
+        return
+
+    try:
+        apps_v1.patch_namespaced_deployment_scale(
+            name=name,
+            namespace=namespace,
+            body={"spec": {"replicas": replicas}},
         )
-    except pykube.exceptions.ObjectDoesNotExist:
-        logging.warning("Deployment %s/%s does not exist", namespace, name)
-        return
-
-    if replicas == deployment.replicas:
-        return
-
-    try:
-        deployment.patch({"spec": {"replicas": replicas}}, subresource="scale")
         logging.info(
             "Deployment %s/%s scaled to %s replicas", namespace, name, replicas
         )
 
-    except pykube.exceptions.HTTPError as err:
+    except ApiException as err:
         logging.error(
             "Exception raised while patching deployment %s/%s", namespace, name
         )
@@ -202,31 +223,38 @@ def scale_hpa(
     name: str, namespace: str, min_replicas: int | None, max_replicas: int | None
 ) -> None:
     """Adjust hpa min and max number of replicas"""
+    autoscaling_v1 = client.AutoscalingV1Api()
 
     try:
-        hpa = (
-            pykube.HorizontalPodAutoscaler.objects(api)
-            .filter(namespace=namespace)
-            .get(name=name)
+        hpa = autoscaling_v1.read_namespaced_horizontal_pod_autoscaler(
+            name=name, namespace=namespace
         )
-    except pykube.exceptions.ObjectDoesNotExist:
-        logging.warning("HPA %s/%s does not exist", namespace, name)
+    except ApiException as err:
+        if err.status == 404:
+            logging.warning("HPA %s/%s does not exist", namespace, name)
+        else:
+            logging.error("Exception raised while reading HPA %s/%s", namespace, name)
+            logging.exception(err)
         return
 
     patch = {}
 
-    spec = hpa.obj["spec"]
-    if min_replicas is not None and min_replicas != spec["minReplicas"]:
+    spec = hpa.spec
+    if min_replicas is not None and min_replicas != spec.min_replicas:
         patch["minReplicas"] = min_replicas
 
-    if max_replicas is not None and max_replicas != spec["maxReplicas"]:
+    if max_replicas is not None and max_replicas != spec.max_replicas:
         patch["maxReplicas"] = max_replicas
 
     if not patch:
         return
 
     try:
-        hpa.patch({"spec": patch})
+        autoscaling_v1.patch_namespaced_horizontal_pod_autoscaler(
+            name=name,
+            namespace=namespace,
+            body={"spec": patch},
+        )
         if min_replicas:
             logging.info(
                 "HPA %s/%s minReplicas set to %s", namespace, name, min_replicas
@@ -235,7 +263,7 @@ def scale_hpa(
             logging.info(
                 "HPA %s/%s maxReplicas set to %s", namespace, name, max_replicas
             )
-    except pykube.exceptions.HTTPError as err:
+    except ApiException as err:
         logging.error("Exception raised while patching HPA %s/%s", namespace, name)
         logging.exception(err)
 
@@ -282,7 +310,7 @@ def processor(queue: Queue) -> None:
 shutdown = False
 SHUTDOWN_TIMEOUT_SECONDS = 60
 queue: Queue[ScaleTarget] = Queue()
-api = get_kube_api()
+get_kube_api()
 
 signal(SIGTERM, handle_shutdown)
 signal(SIGINT, handle_shutdown)
