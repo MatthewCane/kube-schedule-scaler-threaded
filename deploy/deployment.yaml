@@ -60,6 +60,9 @@ spec:
       labels:
         app: kube-schedule-scaler
     spec:
+      volumes:
+      - name: venv
+        emptyDir: {}
       serviceAccountName: kube-schedule-scaler
       securityContext:
         runAsUser: 1000
@@ -69,7 +72,10 @@ spec:
         imagePullPolicy: Always
         resources:
           limits:
-            memory: 128Mi
+            memory: 512Mi
           requests:
             cpu: 50m
-            memory: 128Mi
+            memory: 256Mi
+        volumeMounts:
+        - name: venv
+          mountPath: /app/.venv

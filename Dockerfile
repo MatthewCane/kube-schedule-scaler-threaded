@@ -2,6 +2,7 @@ FROM python:3.13-slim-trixie
 
 ENV UV_COMPILE_BYTECODE=1
 ENV UV_NO_CACHE=1
+ENV UV_LINK_MODE=copy
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/
 
