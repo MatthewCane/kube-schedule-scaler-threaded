@@ -1,4 +1,4 @@
-FROM python:3.13-slim-trixie
+FROM python:3.12-slim-trixie
 
 ENV UV_COMPILE_BYTECODE=1
 ENV UV_NO_CACHE=1
